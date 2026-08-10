@@ -47,6 +47,8 @@
 
 <div id="sci" style="height:100dvh;display:flex;flex-direction:column;background:#0d0906;color:#efe3dc;font-family:'IBM Plex Mono',ui-monospace,monospace;position:relative;overflow:hidden;-webkit-tap-highlight-color:transparent">
 
+  <audio id="sciaudio" preload="auto" playsinline></audio>
+
   <div id="sciscan" style="position:absolute;inset:0;z-index:60;pointer-events:none;background:repeating-linear-gradient(180deg,rgba(224,115,63,0.035) 0px,rgba(224,115,63,0.035) 1px,transparent 1px,transparent 3px)"></div>
   <div style="position:absolute;inset:0;z-index:59;pointer-events:none;background:radial-gradient(120% 80% at 12% 0%, rgba(140,52,20,0.26) 0%, transparent 58%), radial-gradient(130% 100% at 50% 40%, transparent 40%, rgba(0,0,0,0.78) 100%)"></div>
 
@@ -486,11 +488,11 @@ class Component extends DCLogic {
     if (this._onKey) document.removeEventListener('keydown', this._onKey);
     if (this._onScroll && this._track) this._track.removeEventListener('scroll', this._onScroll);
     if (this._anim) cancelAnimationFrame(this._anim);
-    if (this._unlock) ['pointerdown', 'keydown', 'touchstart'].forEach((t) => document.removeEventListener(t, this._unlock));
-    try { if (this._node) this._node.stop(); } catch (e) {}
-    if (this._ctx) { try { this._ctx.close(); } catch (e) {} }
-    if (this._el) { this._el.pause(); this._el.src = ''; }
-    this._node = this._ctx = this._gain = this._el = null;
+    if (this._unlock) ['pointerdown', 'keydown', 'touchstart', 'click'].forEach((t) => document.removeEventListener(t, this._unlock, true));
+    if (this.timers) { this.timers.forEach(clearInterval); this.timers = []; }
+    if (this._el) { this._el.pause(); }
+    if (window.__sciBgm === this._el) { try { delete window.__sciBgm; } catch (e) {} }
+    this._el = null;
   }
 
   wire() {
@@ -615,129 +617,123 @@ class Component extends DCLogic {
     go(isFinite(start) ? start - 1 : 0, false);
   }
 
-  /* gapless looped score: Web Audio buffer loop (sample-accurate, no mp3 padding gap),
-     with an <audio loop> fallback and a first-gesture unlock for autoplay policies */
+  /* Looped score on a plain <audio> element, the same approach as the G7 dossier.
+     An element gets a real playback session on iOS, so it reaches the speaker with the
+     ringer switch off; Web Audio is treated as an ambient UI sound and gets muted. */
   audio(root) {
     const p = this.props || {};
     if (p.audio === false) return;
+    const el = root.querySelector('#sciaudio');
     const btn = root.querySelector('#sciaud');
-    /* try each location in turn: the project's uploads/ folder locally, audio/ or the
-       repo root once deployed. The first that fetches wins, so the same build works
-       in both places without editing a path. */
-    const urls = [p.audioSrc, 'uploads/bgm_audio.mp3', 'audio/bgm_audio.mp3', 'bgm_audio.mp3', 'image/bgm_audio.mp3'].filter(Boolean);
-    let url = urls[0];
-    const vol = Math.max(0, Math.min(1, p.audioVolume == null ? 0.45 : p.audioVolume));
-    const AC = window.AudioContext || window.webkitAudioContext;
-    let muted = false, started = false;
+    if (!el) return;
 
-    const live = () => (this._ctx && this._ctx.state === 'running') || (this._el && !this._el.paused);
+    /* A remount or a live code reload leaves the previous player running: a detached
+       media element keeps playing, which is heard as the track doubled over itself.
+       Silence whatever was playing before claiming this one. */
+    try {
+      const prev = window.__sciBgm;
+      if (prev && prev !== el) { prev.pause(); prev.removeAttribute('src'); prev.load(); }
+    } catch (e) {}
+    window.__sciBgm = el;
+    this._el = el;
+    if (el.dataset.wired === '1') return;
+    el.dataset.wired = '1';
+
+    /* measured from the file: full level to 127.5s, a 7s fade-out to 134.75s, then 7.45s
+       of dead air. Looping at the top of the fade means the track restarts while it is
+       still playing, so there is no quiet tail and no gap at all. */
+    const LOOP_START = 0.55, LOOP_END = 128.2;
+    const sources = [p.audioSrc, 'uploads/bgm_audio.mp3', 'audio/bgm_audio.mp3',
+      'bgm_audio.mp3', 'assets/bgm_audio.mp3'].filter(Boolean);
+    const vol = Math.max(0, Math.min(1, p.audioVolume == null ? 0.45 : p.audioVolume));
+    let si = 0, resolved = false;
+
+    try {
+      if (navigator.audioSession && navigator.audioSession.type !== 'playback') {
+        navigator.audioSession.type = 'playback';
+      }
+    } catch (e) {}
+
+    el.volume = vol;
+    el.playsInline = true;
+
     const paint = () => {
       if (!btn) return;
-      const on = live() && !muted;
-      btn.textContent = live() ? (muted ? '\u266a OFF' : '\u266a') : 'TAP \u266a';
-      btn.style.width = live() ? (muted ? '58px' : '42px') : '62px';
-      btn.style.fontSize = live() && !muted ? '12px' : '9px';
-      btn.style.letterSpacing = live() && !muted ? '0' : '0.1em';
+      const on = !el.paused && !el.muted;
+      btn.textContent = el.paused ? 'TAP \u266a' : (el.muted ? '\u266a OFF' : '\u266a');
+      btn.style.width = el.paused ? '62px' : (el.muted ? '58px' : '42px');
+      btn.style.fontSize = on ? '12px' : '9px';
+      btn.style.letterSpacing = on ? '0' : '0.1em';
       btn.style.color = on ? '#e0733f' : '#7a6459';
-      btn.title = live() ? (muted ? 'Audio muted' : 'Audio playing') : 'Tap to start audio';
+      btn.title = el.paused
+        ? 'Tap to start audio'
+        : (el.muted ? 'Audio muted' : 'Audio playing');
     };
 
-    /* element fallback walks the same candidate list: on file:// and on any host
-       where fetch is refused, this is the only path that can play */
-    const startEl = (i) => {
-      const idx = i || 0;
-      if (idx >= urls.length) { paint(); return; }
-      if (this._el) { this._el.pause(); this._el.src = ''; }
-      const el = new Audio(urls[idx]);
-      el.loop = true; el.preload = 'auto'; el.volume = muted ? 0 : vol;
-      el.addEventListener('error', () => { this._el = null; startEl(idx + 1); });
-      this._el = el;
-      url = urls[idx];
-      el.play().then(paint).catch(() => paint());
-    };
-
-    const grab = async () => {
-      let last;
-      for (const u of urls) {
-        try {
-          const r = await fetch(u);
-          if (!r.ok) { last = new Error(u + ' ' + r.status); continue; }
-          const b = await r.arrayBuffer();
-          if (b.byteLength < 1024) { last = new Error(u + ' too small'); continue; }
-          url = u;
-          return b;
-        } catch (e) { last = e; }
+    el.addEventListener('canplay', () => { resolved = true; paint(); });
+    el.addEventListener('error', () => {
+      if (resolved) return;
+      si++;
+      if (si < sources.length) { el.src = sources[si]; el.load(); return; }
+      if (btn) {
+        btn.textContent = '!';
+        btn.style.color = '#c94f24';
+        btn.title = 'Audio file not found. Tried: ' + sources.join(', ');
       }
-      throw last || new Error('no audio source');
+    });
+    el.addEventListener('play', () => { el.volume = level(); paint(); });
+    el.addEventListener('pause', paint);
+
+    /* Seek the instant LOOP_END is crossed. timeupdate only fires ~4x/sec, which let up
+       to 250ms of fade through, so poll on a short interval instead. Nothing touches the
+       volume: the loop point sits mid-fade, so levels either side of the seam are close
+       and a bare seek does not click. Any ramp here would have to survive a backgrounded
+       tab, where both rAF and short timers stop, and would strand the track at silence. */
+    const level = () => (el.muted ? 0 : vol);
+    const wrap = () => {
+      if (el.volume !== level()) el.volume = level();
+      if (el.currentTime >= LOOP_END && !el.seeking) el.currentTime = LOOP_START;
     };
-
-    /* fetch the bytes at load, but do NOT touch AudioContext yet: iOS only honours a
-       context that is constructed and resumed inside the gesture itself */
-    const bytes = grab().catch(() => null);
-
-    const decode = (ctx, buf) => new Promise((res, rej) => {
-      const r = ctx.decodeAudioData(buf, res, rej);
-      if (r && r.then) r.then(res, rej);
+    this.timers = this.timers || [];
+    this.timers.push(setInterval(wrap, 50));
+    el.addEventListener('ended', () => {
+      el.currentTime = LOOP_START;
+      el.play().catch(() => {});
     });
 
-    /* must run synchronously from a real user gesture on mobile */
-    const ignite = () => {
-      if (!AC) { startEl(0); return; }
-      if (!this._ctx) {
-        try { this._ctx = new AC(); } catch (e) { startEl(0); return; }
-        const gain = this._ctx.createGain();
-        gain.gain.value = muted ? 0 : vol;
-        gain.connect(this._ctx.destination);
-        this._gain = gain;
-      }
-      const ctx = this._ctx;
-      ctx.resume().then(paint).catch(() => {});
-      if (!this._primed) {
-        /* one silent frame through the graph: what actually unlocks iOS */
-        this._primed = true;
-        try {
-          const s = ctx.createBufferSource();
-          s.buffer = ctx.createBuffer(1, 1, 22050);
-          s.connect(this._gain); s.start(0);
-        } catch (e) {}
-      }
-      if (!started) {
-        started = true;
-        bytes.then((b) => {
-          if (!b) throw new Error('no bytes');
-          return decode(ctx, b.slice(0));
-        }).then((buf) => {
-          const node = ctx.createBufferSource();
-          node.buffer = buf; node.loop = true; node.connect(this._gain); node.start(0);
-          this._node = node;
-          ctx.resume().catch(() => {});
-          paint();
-        }).catch(() => {
-          started = false;
-          startEl(0);
-        });
-      }
-      paint();
-      setTimeout(paint, 150);
-    };
+    el.src = sources[0];
+
+    try {
+      const t = parseFloat(localStorage.getItem('sci_bgm_t') || '0');
+      if (t > 0 && isFinite(t) && t < LOOP_END) el.currentTime = t;
+    } catch (e) {}
+    this.timers = this.timers || [];
+    this.timers.push(setInterval(() => {
+      try { if (!el.paused) localStorage.setItem('sci_bgm_t', String(el.currentTime)); } catch (e) {}
+    }, 3000));
+
+    const tryPlay = () => { el.play().then(paint).catch(paint); };
 
     this._unlock = () => {
-      ignite();
-      if (this._el && this._el.paused) this._el.play().catch(() => {});
-      if (live()) ['pointerdown', 'keydown', 'touchstart', 'click'].forEach((t) => document.removeEventListener(t, this._unlock, true));
+      if (el.paused) tryPlay();
+      if (!el.paused) {
+        ['pointerdown', 'keydown', 'touchstart', 'click'].forEach((t) =>
+          document.removeEventListener(t, this._unlock, true));
+      }
     };
-    ['pointerdown', 'keydown', 'touchstart', 'click'].forEach((t) => document.addEventListener(t, this._unlock, true));
+    ['pointerdown', 'keydown', 'touchstart', 'click'].forEach((t) =>
+      document.addEventListener(t, this._unlock, true));
 
-    if (btn) btn.addEventListener('click', () => {
-      if (!live()) { this._unlock(); return; }
-      muted = !muted;
-      if (this._gain) this._gain.gain.value = muted ? 0 : vol;
-      if (this._el) this._el.volume = muted ? 0 : vol;
+    if (btn) btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (el.paused) { tryPlay(); return; }
+      el.muted = !el.muted;
+      el.volume = level();
       paint();
     });
 
     paint();
-    ignite();
+    tryPlay();
   }
 }
 

@@ -13,8 +13,8 @@
 <meta property="og:image" content="https://ghoust640.github.io/SCI-FILE/image/SCI-Intel-Link-Card-selection.png">
 <meta property="og:image:secure_url" content="https://ghoust640.github.io/SCI-FILE/image/SCI-Intel-Link-Card-selection.png">
 <meta property="og:image:type" content="image/png">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
+<meta property="og:image:width" content="2400">
+<meta property="og:image:height" content="1260">
 <meta property="og:image:alt" content="SCI-01 hostile force file cover card">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="SCI-01 · Shattered Crown Initiative">
@@ -628,7 +628,7 @@ class Component extends DCLogic {
     let url = urls[0];
     const vol = Math.max(0, Math.min(1, p.audioVolume == null ? 0.45 : p.audioVolume));
     const AC = window.AudioContext || window.webkitAudioContext;
-    let muted = false, booted = false;
+    let muted = false, started = false;
 
     const live = () => (this._ctx && this._ctx.state === 'running') || (this._el && !this._el.paused);
     const paint = () => {
@@ -642,11 +642,17 @@ class Component extends DCLogic {
       btn.title = live() ? (muted ? 'Audio muted' : 'Audio playing') : 'Tap to start audio';
     };
 
-    const startEl = () => {
-      if (this._el) return;
-      const el = new Audio(url);
+    /* element fallback walks the same candidate list: on file:// and on any host
+       where fetch is refused, this is the only path that can play */
+    const startEl = (i) => {
+      const idx = i || 0;
+      if (idx >= urls.length) { paint(); return; }
+      if (this._el) { this._el.pause(); this._el.src = ''; }
+      const el = new Audio(urls[idx]);
       el.loop = true; el.preload = 'auto'; el.volume = muted ? 0 : vol;
+      el.addEventListener('error', () => { this._el = null; startEl(idx + 1); });
       this._el = el;
+      url = urls[idx];
       el.play().then(paint).catch(() => paint());
     };
 
@@ -665,44 +671,62 @@ class Component extends DCLogic {
       throw last || new Error('no audio source');
     };
 
-    /* decode up front so the loop can begin the instant playback is permitted */
-    const boot = async () => {
-      if (booted || !AC) { if (!AC) startEl(); return; }
-      booted = true;
-      try {
-        const ctx = new AC();
-        this._ctx = ctx;
-        const gain = ctx.createGain();
-        gain.gain.value = muted ? 0 : vol;
-        gain.connect(ctx.destination);
-        this._gain = gain;
-        const buf = await grab().then((b) => ctx.decodeAudioData(b));
-        const node = ctx.createBufferSource();
-        node.buffer = buf; node.loop = true; node.connect(gain); node.start(0);
-        this._node = node;
-      } catch (e) {
-        this._ctx = null; this._gain = null; this._node = null;
-        startEl();
-      }
-      kick();
-    };
+    /* fetch the bytes at load, but do NOT touch AudioContext yet: iOS only honours a
+       context that is constructed and resumed inside the gesture itself */
+    const bytes = grab().catch(() => null);
 
-    /* never await resume(): a blocked context leaves that promise pending forever */
-    const kick = () => {
-      if (this._ctx && this._ctx.state !== 'running') {
-        this._ctx.resume().then(paint).catch(() => {});
+    const decode = (ctx, buf) => new Promise((res, rej) => {
+      const r = ctx.decodeAudioData(buf, res, rej);
+      if (r && r.then) r.then(res, rej);
+    });
+
+    /* must run synchronously from a real user gesture on mobile */
+    const ignite = () => {
+      if (!AC) { startEl(0); return; }
+      if (!this._ctx) {
+        try { this._ctx = new AC(); } catch (e) { startEl(0); return; }
+        const gain = this._ctx.createGain();
+        gain.gain.value = muted ? 0 : vol;
+        gain.connect(this._ctx.destination);
+        this._gain = gain;
       }
-      if (this._el && this._el.paused) this._el.play().then(paint).catch(() => {});
+      const ctx = this._ctx;
+      ctx.resume().then(paint).catch(() => {});
+      if (!this._primed) {
+        /* one silent frame through the graph: what actually unlocks iOS */
+        this._primed = true;
+        try {
+          const s = ctx.createBufferSource();
+          s.buffer = ctx.createBuffer(1, 1, 22050);
+          s.connect(this._gain); s.start(0);
+        } catch (e) {}
+      }
+      if (!started) {
+        started = true;
+        bytes.then((b) => {
+          if (!b) throw new Error('no bytes');
+          return decode(ctx, b.slice(0));
+        }).then((buf) => {
+          const node = ctx.createBufferSource();
+          node.buffer = buf; node.loop = true; node.connect(this._gain); node.start(0);
+          this._node = node;
+          ctx.resume().catch(() => {});
+          paint();
+        }).catch(() => {
+          started = false;
+          startEl(0);
+        });
+      }
       paint();
-      setTimeout(paint, 120);
+      setTimeout(paint, 150);
     };
 
     this._unlock = () => {
-      if (!booted) { boot(); return; }
-      kick();
-      if (live()) ['pointerdown', 'keydown', 'touchstart'].forEach((t) => document.removeEventListener(t, this._unlock, true));
+      ignite();
+      if (this._el && this._el.paused) this._el.play().catch(() => {});
+      if (live()) ['pointerdown', 'keydown', 'touchstart', 'click'].forEach((t) => document.removeEventListener(t, this._unlock, true));
     };
-    ['pointerdown', 'keydown', 'touchstart'].forEach((t) => document.addEventListener(t, this._unlock, true));
+    ['pointerdown', 'keydown', 'touchstart', 'click'].forEach((t) => document.addEventListener(t, this._unlock, true));
 
     if (btn) btn.addEventListener('click', () => {
       if (!live()) { this._unlock(); return; }
@@ -713,7 +737,7 @@ class Component extends DCLogic {
     });
 
     paint();
-    boot();
+    ignite();
   }
 }
 
